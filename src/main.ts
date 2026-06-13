@@ -36,6 +36,7 @@ interface ServiceInfo {
 }
 
 interface ModuleInfo {
+  key: string;
   name: string;
   description: string;
   category: string;
@@ -463,7 +464,7 @@ function renderModuleList() {
     .map(
       (m) => `
     <div class="module-item">
-      <select data-module="${escHtml(m.name)}">
+      <select data-module="${escHtml(m.key)}">
         <option value="auto"${(moduleSettings[m.name] ?? "auto") === "auto" ? " selected" : ""}>${escHtml(t("module.auto"))}</option>
         <option value="enable"${moduleSettings[m.name] === "enable" ? " selected" : ""}>${escHtml(t("module.enable"))}</option>
         <option value="disable"${moduleSettings[m.name] === "disable" ? " selected" : ""}>${escHtml(t("module.disable"))}</option>
