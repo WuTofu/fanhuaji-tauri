@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Fanhuaji",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "identifier": "org.zhconvert.fanhuaji",
   "build": {
     "frontendDist": "../dist",
@@ -42,9 +42,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYxOUM3RDI5NzUwRkFERDkKUldUWnJROTFLWDJjOFFBYXFPZjNzbjJtQXArMDl3dldzR0RqNGYvMEVxKzVyTmxCN1Q0UGFtZUsK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ0NDU5OTYyNUVBMDMxOTIKUldTU01hQmVZcGxGUkU4a1Z6T2h6L1FiWXZuclBmQndCM3NFZlBTOGlSd1hpbTAzTDZ0ckU2OWYK",
       "endpoints": [
-        "https://github.com/7a6163/fanhuaji-tauri/releases/latest/download/latest.json"
+        "https://github.com/WuTofu/fanhuaji-tauri/releases/latest/download/latest.json"
       ]
     }
   }
