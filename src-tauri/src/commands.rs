@@ -211,6 +211,67 @@ pub async fn preview_convert(
     })
 }
 
+/// Convert a single XML/XHTML file in the EPUB temp directory in-place.
+/// Reads the file, extracts text nodes, calls the Fanhuaji API, replaces text
+/// nodes with the converted result, and writes the file back.
+///
+/// Returns `Ok(())` on success (including when the file has no text nodes to
+/// convert). Returns `Err` with a diagnostic code on any failure.
+#[allow(clippy::too_many_arguments)]
+async fn convert_epub_file(
+    http: &reqwest::Client,
+    url: &str,
+    file_path: &std::path::Path,
+    converter: &str,
+    pre_replace: &str,
+    post_replace: &str,
+    protect_replace: &str,
+    modules: &str,
+) -> Result<(), String> {
+    let xml = tokio::fs::read_to_string(file_path)
+        .await
+        .map_err(|e| format!("FILE_READ_FAILED:{e}"))?;
+
+    let (text, count) = epub::extract_text(&xml)?;
+
+    if count == 0 {
+        return Ok(()); // Nothing to convert — not a failure
+    }
+
+    let api_params = build_api_params(
+        &text,
+        converter,
+        pre_replace,
+        post_replace,
+        protect_replace,
+        modules,
+    );
+
+    let resp = http
+        .post(url)
+        .form(&api_params)
+        .send()
+        .await
+        .map_err(|e| format!("NET_REQUEST_FAILED:{e}"))?;
+
+    let api: ApiResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("RESPONSE_PARSE_FAILED:{e}"))?;
+
+    if api.code != 0 {
+        return Err(format!("API_ERROR:{}", api.code));
+    }
+
+    let data = api.data.ok_or_else(|| "API_NO_DATA".to_string())?;
+
+    let new_xml = epub::replace_text(&xml, &data.text)?;
+
+    tokio::fs::write(file_path, new_xml)
+        .await
+        .map_err(|e| format!("FILE_WRITE_FAILED:{e}"))
+}
+
 #[tauri::command]
 pub async fn convert_epub(
     app: tauri::AppHandle,
@@ -241,20 +302,21 @@ pub async fn convert_epub(
 
     // Extract EPUB
     let canonical_clone = canonical.clone();
-    let (temp_dir, content_files) =
+    let (temp_dir, content_files, metadata_files) =
         tokio::task::spawn_blocking(move || epub::extract_epub(&canonical_clone))
             .await
             .map_err(|e| format!("EPUB_EXTRACT_FAILED:{e}"))??;
 
-    let chapter_total = content_files.len();
+    let chapter_total = content_files.len() + metadata_files.len();
     let url = format!("{API_BASE}/convert");
     let mut failed_chapters: usize = 0;
 
-    // Convert each chapter
-    for (i, content_file) in content_files.iter().enumerate() {
-        let chapter_name = epub::chapter_display_name(&content_file.relative_path);
+    // Convert all files — chapter bodies first, then .opf/.ncx metadata.
+    // Processing them in a single loop ensures any future policy change
+    // (retry logic, delay tuning, error handling) applies uniformly.
+    for (i, file) in content_files.iter().chain(metadata_files.iter()).enumerate() {
+        let chapter_name = epub::chapter_display_name(&file.relative_path);
 
-        // Emit progress
         let _ = app.emit(
             "epub-progress",
             EpubProgress {
@@ -265,79 +327,21 @@ pub async fn convert_epub(
             },
         );
 
-        let file_path = temp_dir.path().join(&content_file.relative_path);
-        let xhtml = match tokio::fs::read_to_string(&file_path).await {
-            Ok(s) => s,
-            Err(_) => {
-                failed_chapters += 1;
-                continue;
-            }
-        };
-
-        // Extract text
-        let (text, count) = match epub::extract_text(&xhtml) {
-            Ok(r) => r,
-            Err(_) => {
-                failed_chapters += 1;
-                continue;
-            }
-        };
-
-        if count == 0 {
-            continue; // No text to convert
-        }
-
-        // Call API
-        let api_params = build_api_params(
-            &text,
+        let file_path = temp_dir.path().join(&file.relative_path);
+        if let Err(e) = convert_epub_file(
+            &client.0,
+            &url,
+            &file_path,
             &converter,
             &pre_replace,
             &post_replace,
             &protect_replace,
             &modules,
-        );
-
-        let resp = match client.0.post(&url).form(&api_params).send().await {
-            Ok(r) => r,
-            Err(_) => {
-                failed_chapters += 1;
-                continue;
-            }
-        };
-
-        let api: ApiResponse = match resp.json().await {
-            Ok(r) => r,
-            Err(_) => {
-                failed_chapters += 1;
-                continue;
-            }
-        };
-
-        if api.code != 0 {
+        )
+        .await
+        {
+            eprintln!("EPUB_CHAPTER_FAILED:{chapter_name}:{e}");
             failed_chapters += 1;
-            continue;
-        }
-
-        let data = match api.data {
-            Some(d) => d,
-            None => {
-                failed_chapters += 1;
-                continue;
-            }
-        };
-
-        // Replace text in XHTML
-        let new_xhtml = match epub::replace_text(&xhtml, &data.text) {
-            Ok(r) => r,
-            Err(_) => {
-                failed_chapters += 1;
-                continue;
-            }
-        };
-
-        if tokio::fs::write(&file_path, new_xhtml).await.is_err() {
-            failed_chapters += 1;
-            continue;
         }
 
         // Small delay between API calls

@@ -27,7 +27,7 @@ const MAX_ENTRY_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Extract an EPUB ZIP to a temp directory and return content file paths.
-pub fn extract_epub(epub_path: &Path) -> Result<(TempDir, Vec<ContentFile>), String> {
+pub fn extract_epub(epub_path: &Path) -> Result<(TempDir, Vec<ContentFile>, Vec<ContentFile>), String> {
     let file = fs::File::open(epub_path).map_err(|e| format!("EPUB_OPEN_FAILED:{e}"))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("EPUB_INVALID:{e}"))?;
 
@@ -102,41 +102,158 @@ pub fn extract_epub(epub_path: &Path) -> Result<(TempDir, Vec<ContentFile>), Str
 
     // Find content files by scanning for .xhtml/.html files
     let content_files = find_content_files(temp_dir.path())?;
+    // Find metadata files (.opf, .ncx) whose text nodes should also be converted
+    let metadata_files = find_metadata_files(temp_dir.path())?;
 
-    Ok((temp_dir, content_files))
+    Ok((temp_dir, content_files, metadata_files))
 }
 
 /// Recursively find all .xhtml and .html files in the extracted EPUB.
 fn find_content_files(dir: &Path) -> Result<Vec<ContentFile>, String> {
     let mut files = Vec::new();
-    find_content_files_recursive(dir, dir, &mut files)?;
+    find_files_by_ext_recursive(dir, dir, &mut files, |e| {
+        e == "xhtml" || e == "html" || e == "htm"
+    })?;
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(files)
 }
 
-fn find_content_files_recursive(
+/// Find the metadata files that contain translatable text:
+/// - The root OPF package document, located via `META-INF/container.xml`.
+/// - The EPUB 2 NCX navigation file, located via the OPF manifest (to avoid
+///   converting stray or backup .ncx files that some authoring tools leave in
+///   the archive alongside the active one).
+fn find_metadata_files(dir: &Path) -> Result<Vec<ContentFile>, String> {
+    let mut files = Vec::new();
+    if let Some(opf) = find_root_opf_from_container(dir)? {
+        if let Some(ncx) = find_ncx_from_opf(dir, &opf.relative_path)? {
+            files.push(ncx);
+        }
+        files.push(opf);
+    }
+    Ok(files)
+}
+
+/// Read `META-INF/container.xml` and return the path of the root OPF document.
+/// Returns `None` if `container.xml` is absent or contains no `rootfile` element.
+fn find_root_opf_from_container(dir: &Path) -> Result<Option<ContentFile>, String> {
+    let container_path = dir.join("META-INF/container.xml");
+    if !container_path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&container_path)
+        .map_err(|e| format!("CONTAINER_READ_FAILED:{e}"))?;
+
+    let mut reader = Reader::from_str(&content);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
+                if e.local_name().as_ref() == b"rootfile" {
+                    for attr in e.attributes() {
+                        let attr = attr.map_err(|e| format!("XML_ATTR_FAILED:{e}"))?;
+                        if attr.key.local_name().as_ref() == b"full-path" {
+                            let path = attr
+                                .unescape_value()
+                                .map_err(|e| format!("XML_DECODE_FAILED:{e}"))?
+                                .into_owned();
+                            let abs = dir.join(&path);
+                            if abs.starts_with(dir) && abs.exists() {
+                                return Ok(Some(ContentFile { relative_path: path }));
+                            }
+                            // Path not valid on disk — try subsequent <rootfile> elements.
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("XML_PARSE_FAILED:{e}")),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Parse the OPF manifest and return the NCX navigation file path, if present.
+/// Returns `None` for EPUB 3 packages that use nav.xhtml instead of an NCX.
+fn find_ncx_from_opf(dir: &Path, opf_relative: &str) -> Result<Option<ContentFile>, String> {
+    let opf_abs = dir.join(opf_relative);
+    let content = fs::read_to_string(&opf_abs)
+        .map_err(|e| format!("OPF_READ_FAILED:{e}"))?;
+    let opf_dir = Path::new(opf_relative)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+
+    let mut reader = Reader::from_str(&content);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
+                if e.local_name().as_ref() == b"item" {
+                    let mut href: Option<String> = None;
+                    let mut is_ncx = false;
+                    for attr in e.attributes() {
+                        let attr = attr.map_err(|e| format!("XML_ATTR_FAILED:{e}"))?;
+                        match attr.key.local_name().as_ref() {
+                            b"href" => {
+                                href = Some(
+                                    attr.unescape_value()
+                                        .map_err(|e| format!("XML_DECODE_FAILED:{e}"))?
+                                        .into_owned(),
+                                );
+                            }
+                            b"media-type" => {
+                                is_ncx =
+                                    attr.value.as_ref() == b"application/x-dtbncx+xml";
+                            }
+                            _ => {}
+                        }
+                    }
+                    if is_ncx {
+                        if let Some(href) = href {
+                            let relative =
+                                opf_dir.join(&href).to_string_lossy().replace('\\', "/");
+                            let abs = dir.join(&relative);
+                            if abs.starts_with(dir) && abs.exists() {
+                                return Ok(Some(ContentFile {
+                                    relative_path: relative,
+                                }));
+                            }
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("XML_PARSE_FAILED:{e}")),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn find_files_by_ext_recursive(
     root: &Path,
     dir: &Path,
     files: &mut Vec<ContentFile>,
+    ext_match: impl Fn(&str) -> bool + Copy,
 ) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("DIR_READ_FAILED:{e}"))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("DIR_ENTRY_READ_FAILED:{e}"))?;
         let path = entry.path();
         if path.is_dir() {
-            find_content_files_recursive(root, &path, files)?;
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext_lower = ext.to_lowercase();
-            if ext_lower == "xhtml" || ext_lower == "html" || ext_lower == "htm" {
-                let relative = path
-                    .strip_prefix(root)
-                    .map_err(|e| format!("PATH_STRIP_FAILED:{e}"))?
-                    .to_string_lossy()
-                    .into_owned();
-                files.push(ContentFile {
-                    relative_path: relative,
-                });
-            }
+            find_files_by_ext_recursive(root, &path, files, ext_match)?;
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && ext_match(&ext.to_lowercase())
+        {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| format!("PATH_STRIP_FAILED:{e}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.push(ContentFile {
+                relative_path: relative,
+            });
         }
     }
     Ok(())
@@ -173,6 +290,7 @@ pub fn extract_text(xhtml: &str) -> Result<(String, usize), String> {
 pub fn replace_text(xhtml: &str, converted: &str) -> Result<String, String> {
     let segments: Vec<&str> = converted.split(TEXT_DELIMITER).collect();
     let mut seg_idx = 0;
+    let mut text_node_count = 0;
 
     let mut reader = Reader::from_str(xhtml);
     let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -183,12 +301,18 @@ pub fn replace_text(xhtml: &str, converted: &str) -> Result<String, String> {
                 let original = e
                     .unescape()
                     .map_err(|err| format!("XML_DECODE_FAILED:{err}"))?;
-                if !original.trim().is_empty() && seg_idx < segments.len() {
-                    let new_text = BytesText::new(segments[seg_idx]);
-                    writer
-                        .write_event(Event::Text(new_text))
-                        .map_err(|e| format!("XML_WRITE_FAILED:{e}"))?;
-                    seg_idx += 1;
+                if !original.trim().is_empty() {
+                    text_node_count += 1;
+                    if seg_idx < segments.len() {
+                        writer
+                            .write_event(Event::Text(BytesText::new(segments[seg_idx])))
+                            .map_err(|e| format!("XML_WRITE_FAILED:{e}"))?;
+                        seg_idx += 1;
+                    } else {
+                        writer
+                            .write_event(Event::Text(e.into_owned()))
+                            .map_err(|e| format!("XML_WRITE_FAILED:{e}"))?;
+                    }
                 } else {
                     writer
                         .write_event(Event::Text(e.into_owned()))
@@ -203,6 +327,13 @@ pub fn replace_text(xhtml: &str, converted: &str) -> Result<String, String> {
             }
             Err(e) => return Err(format!("XML_PARSE_FAILED:{e}")),
         }
+    }
+
+    if text_node_count != segments.len() {
+        return Err(format!(
+            "SEGMENT_COUNT_MISMATCH:{text_node_count} text nodes but {} converted segments",
+            segments.len()
+        ));
     }
 
     let buf = writer.into_inner().into_inner();
@@ -621,7 +752,7 @@ mod tests {
         let bytes = build_epub_bytes(&[]);
         let tmp = epub_tempfile(&bytes);
 
-        let (dir, content_files) = extract_epub(tmp.path()).unwrap();
+        let (dir, content_files, _metadata_files) = extract_epub(tmp.path()).unwrap();
 
         // mimetype must have been extracted
         assert!(dir.path().join("mimetype").exists());
@@ -640,7 +771,7 @@ mod tests {
         let bytes = build_epub_bytes(&[("OEBPS/chapter2.xhtml", ch2)]);
         let tmp = epub_tempfile(&bytes);
 
-        let (_dir, content_files) = extract_epub(tmp.path()).unwrap();
+        let (_dir, content_files, _metadata_files) = extract_epub(tmp.path()).unwrap();
 
         assert_eq!(content_files.len(), 2);
         // Must be sorted: chapter1 before chapter2
@@ -652,7 +783,7 @@ mod tests {
         let bytes = build_epub_bytes(&[("OEBPS/cover.jpg", b"JFIF")]);
         let tmp = epub_tempfile(&bytes);
 
-        let (_dir, content_files) = extract_epub(tmp.path()).unwrap();
+        let (_dir, content_files, _metadata_files) = extract_epub(tmp.path()).unwrap();
 
         // cover.jpg must not appear in content_files
         for cf in &content_files {
@@ -725,7 +856,7 @@ mod tests {
         let bytes = zip.finish().unwrap().into_inner();
 
         let tmp = epub_tempfile(&bytes);
-        let (dir, _) = extract_epub(tmp.path()).expect("extract should succeed");
+        let (dir, _, _) = extract_epub(tmp.path()).expect("extract should succeed");
 
         assert!(
             dir.path().join("OEBPS/Text").is_dir(),
@@ -820,7 +951,7 @@ mod tests {
         // Build and extract a minimal EPUB, then repack it and inspect the result.
         let bytes = build_epub_bytes(&[]);
         let tmp = epub_tempfile(&bytes);
-        let (extracted_dir, _) = extract_epub(tmp.path()).unwrap();
+        let (extracted_dir, _, _) = extract_epub(tmp.path()).unwrap();
 
         let output = NamedTempFile::new().unwrap();
         repack_epub(extracted_dir.path(), output.path()).unwrap();
@@ -829,7 +960,7 @@ mod tests {
         let repacked_file = fs::File::open(output.path()).unwrap();
         let mut archive = ZipArchive::new(repacked_file).unwrap();
 
-        assert!(archive.len() > 0, "repacked ZIP must not be empty");
+        assert!(!archive.is_empty(), "repacked ZIP must not be empty");
 
         // Entry at index 0 must be mimetype
         let entry0 = archive.by_index(0).unwrap();
@@ -853,7 +984,7 @@ mod tests {
         let ch2 = r#"<html><body><p>第二章</p></body></html>"#.as_bytes();
         let bytes = build_epub_bytes(&[("OEBPS/chapter2.xhtml", ch2)]);
         let tmp = epub_tempfile(&bytes);
-        let (extracted_dir, _) = extract_epub(tmp.path()).unwrap();
+        let (extracted_dir, _, _) = extract_epub(tmp.path()).unwrap();
 
         let output = NamedTempFile::new().unwrap();
         repack_epub(extracted_dir.path(), output.path()).unwrap();
